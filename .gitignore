@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+._*
+.vscode/
+Results/
+Code/SNTO 3D/Data/*.pt

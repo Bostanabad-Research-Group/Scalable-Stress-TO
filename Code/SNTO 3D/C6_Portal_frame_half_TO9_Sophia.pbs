@@ -1,0 +1,192 @@
+#!/bin/bash
+#PBS -N C6_Portal_frame_half_TO9_Sophia_3D
+#PBS -l select=1:ngpus=2:ncpus=32:mem=128gb
+#PBS -l walltime=18:00:00
+#PBS -q by-gpu
+#PBS -A UQ_TopOpt
+#PBS -l filesystems=home
+
+# C6_Portal_frame_half_TO9_Sophia.py (3D) -- UNIFIED single-GPU + DDP (merged-lag + N_MASK),
+# L_beam_3D 500K data (C3D8R). Two knobs:
+#   NGPUS             = number of GPUs (= ranks).  1 -> plain python (world_size=1,
+#                       NO distributed init); >1 -> torchrun DDP.
+#   SUBSLICE_PER_RANK = element-disjoint slices PER GPU (the "N_slice" knob). 3D is
+#                       memory-heavy -> raise this (or NGPUS) if the peak-memory
+#                       readout approaches the GPU capacity.
+#   -> total slices = NGPUS * SUBSLICE_PER_RANK.
+#
+# TO CHANGE GPU COUNT you must edit THREE things together:
+#   (1) the `#PBS -l select=...:ngpus=N` line above,
+#   (2) the `#PBS -q` queue  (by-gpu for 1-8 GPUs; by-node for whole-node jobs),
+#   (3) NGPUS=N below.
+#
+# NOTE (3D resources): walltime 24h for C2 (3D 500K x 5 seeds at ~3h/seed, 2 slices, 1 GPU).
+#   select/mem inherited from the 2D template -- if the "[rank] peak GPU mem" readout
+#   printed early in the log approaches capacity, raise SUBSLICE_PER_RANK or NGPUS.
+#
+# DATA: expects $PWD/Data/Portal_frame_half_3D_GPU1_C3D8R_2M.pt  (3D, 2M)
+
+# create the results dir and send ALL job output/error there directly
+# (no PBS -o/-e staging: that requires the dir to pre-exist and was
+# flapping the job E<->R when it did not). exec redirects this shell.
+# NOTE: Example='Portal_frame_half_3D' in the driver -> Results/Portal_frame_half_3D/<Case>/.
+mkdir -p /home/alexsunuci/Aug_21_3D/Results/Portal_frame_half_3D/C6_Portal_frame_half_TO9_Sophia
+exec > "/home/alexsunuci/Aug_21_3D/Results/Portal_frame_half_3D/C6_Portal_frame_half_TO9_Sophia/C6_Portal_frame_half_TO9_Sophia.out" 2> "/home/alexsunuci/Aug_21_3D/Results/Portal_frame_half_3D/C6_Portal_frame_half_TO9_Sophia/C6_Portal_frame_half_TO9_Sophia.err"
+
+nvidia-smi
+
+cd /home/alexsunuci/Aug_21_3D
+source /home/alexsunuci/virtual_env/TO/bin/activate
+
+# ---------------- knobs ----------------
+NGPUS=2                              # keep == ngpus= in the select line
+export SUBSLICE_PER_RANK=4           # slices per GPU  (total slices = NGPUS * this = 8)
+export RESUME=1                      # resume from Run_i/resume_ckpt.pth if present (else fresh)
+export RESUME_INTERVAL=1000          # checkpoint full state every N epochs (~50 min at ~3 s/epoch)
+# ---------------------------------------
+
+export OMP_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=${OMP_NUM_THREADS}
+export MKL_NUM_THREADS=${OMP_NUM_THREADS}
+
+# ==================== robust GPU pinning ====================
+# Claim $1 distinct GPUs on THIS node WITHOUT racing co-located jobs. Preference:
+#   (1) scheduler-assigned $PBS_GPUFILE, (2) a pre-set $CUDA_VISIBLE_DEVICES,
+#   (3) atomically lock the most-free, UNLOCKED GPUs via node-local lock dirs so two
+#       jobs on the same node never grab the same device (the collision we hit when
+#       PBS_GPUFILE was unset and every job picked the "emptiest" GPU 7).
+# Stale locks (owner PID no longer alive) are reclaimed. Locks freed on exit.
+GPU_LOCKS=""
+release_gpu_locks() { [ -n "${GPU_LOCKS}" ] && rm -rf ${GPU_LOCKS} 2>/dev/null; }
+trap release_gpu_locks EXIT INT TERM
+
+# --- Option 1: log occupancy of the node's GPUs at job start, so the .out itself
+#     records whether we are sharing (a foreign PID before ours) or contended (util
+#     already high). No need to watch the job live -- just grep the .out afterwards. ---
+report_gpu_occupancy() {
+    echo "==================== GPU occupancy at job start ===================="
+    echo "host=$(hostname)   using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}   user=${USER:-$(id -un)}"
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
+    echo "---- running compute processes on this node (any PID before ours => sharing) ----"
+    nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader
+    echo "==================================================================="
+}
+
+# --- Option 1: refuse an over-subscribed GPU and requeue instead of OOMing.
+#     On the shared by-gpu queue the scheduler can place us on a physical GPU that
+#     another job already fills; the cgroup gives us no other GPU to move to, so
+#     python would OOM at its first allocation. If the assigned GPU lacks room,
+#     resubmit THIS job (fresh GPU assignment) up to MAX_REQUEUE times. Knobs are
+#     overridable at submit time, e.g.  qsub -v MIN_FREE_MIB=8000 <job>.pbs
+requeue_if_gpu_busy() {
+    local need self ids min_free free g
+    need="${MIN_FREE_MIB:-30000}"
+    # check EVERY GPU this job will use (all of CUDA_VISIBLE_DEVICES), not just the first
+    ids="${CUDA_VISIBLE_DEVICES//,/ }"
+    min_free=99999999
+    for g in ${ids}; do
+        free="$(nvidia-smi -i "${g}" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')"
+        [ -n "${free}" ] && [ "${free}" -lt "${min_free}" ] && min_free="${free}"
+    done
+    if [ "${min_free:-0}" -ge "${need}" ]; then
+        echo "All GPUs [${CUDA_VISIBLE_DEVICES}] have >= ${need} MiB free (min ${min_free}) -- running."
+        return
+    fi
+    echo "A GPU in [${CUDA_VISIBLE_DEVICES}] has only ${min_free} MiB free (< ${need} needed) on $(hostname) -- refusing."
+    if [ "${ATTEMPT:-1}" -lt "${MAX_REQUEUE:-5}" ]; then
+        self="/home/alexsunuci/Aug_21_3D/C6_Portal_frame_half_TO9_Sophia.pbs"
+        echo "Requeuing (attempt ${ATTEMPT:-1} of ${MAX_REQUEUE:-5}) -> ${self}"
+        if qsub -v ATTEMPT=$(( ${ATTEMPT:-1} + 1 )) "${self}"; then
+            echo "requeued OK; exiting this attempt."
+            exit 0
+        fi
+        echo "qsub requeue FAILED -- please resubmit by hand." >&2
+        exit 1
+    fi
+    echo "Gave up after ${MAX_REQUEUE:-5} attempts (kept landing on full GPUs)." >&2
+    exit 1
+}
+
+claim_gpus() {
+    local need="$1" lockdir claimed n g lk pid
+    if [ -n "${PBS_GPUFILE:-}" ] && [ -f "${PBS_GPUFILE}" ]; then
+        export CUDA_VISIBLE_DEVICES="$(grep -oE '[0-9]+$' "${PBS_GPUFILE}" | paste -sd, -)"
+        echo "GPU pinning: PBS_GPUFILE -> ${CUDA_VISIBLE_DEVICES}"; return
+    fi
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        echo "GPU pinning: pre-set CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"; return
+    fi
+    lockdir="${GPU_LOCK_DIR:-/tmp/gpu_locks_${USER:-$(id -un)}}"
+    mkdir -p "${lockdir}" 2>/dev/null
+    claimed=""; n=0
+    for g in $(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+               | sort -t, -k2 -nr | awk -F, '{gsub(/ /,"",$1); print $1}'); do
+        [ "${n}" -ge "${need}" ] && break
+        lk="${lockdir}/gpu${g}"
+        if [ -d "${lk}" ]; then                       # reclaim a stale lock (owner dead)
+            pid="$(cat "${lk}/pid" 2>/dev/null)"
+            if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then rm -rf "${lk}" 2>/dev/null; fi
+        fi
+        if mkdir "${lk}" 2>/dev/null; then            # atomic claim
+            echo $$ > "${lk}/pid"
+            GPU_LOCKS="${GPU_LOCKS} ${lk}"
+            claimed="${claimed:+${claimed},}${g}"; n=$((n+1))
+        fi
+    done
+    if [ "${n}" -lt "${need}" ]; then                 # last resort (may share)
+        echo "WARNING: locked only ${n}/${need} GPUs on $(hostname); using emptiest for the rest" >&2
+        claimed="$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+                   | sort -t, -k2 -nr | head -n "${need}" | awk -F, '{gsub(/ /,"",$1); print $1}' | paste -sd, -)"
+    fi
+    export CUDA_VISIBLE_DEVICES="${claimed:-0}"
+    echo "GPU pinning: locked [${CUDA_VISIBLE_DEVICES}] on $(hostname)  (lockdir ${lockdir})"
+}
+# ============================================================
+
+if [ "${NGPUS}" -eq 1 ]; then
+    # --- SINGLE GPU: pick one FREE GPU, run plain python (world_size=1, no DDP) ---
+    echo "PBS_GPUFILE=${PBS_GPUFILE:-<unset>}"
+    claim_gpus 1
+    report_gpu_occupancy
+    requeue_if_gpu_busy
+    echo "SINGLE GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}, N_slice=${SUBSLICE_PER_RANK}"
+    python /home/alexsunuci/Aug_21_3D/C6_Portal_frame_half_TO9_Sophia.py
+else
+    # --- MULTI-GPU: DDP via torchrun, one rank per GPU (each pins via LOCAL_RANK) ---
+    # Honor the GPUs PBS actually assigned (by-gpu is a SHARED queue). Without this,
+    # torchrun's local ranks grab PHYSICAL GPU 0/1, which may belong to another job.
+    echo "PBS_GPUFILE=${PBS_GPUFILE:-<unset>}"
+    claim_gpus "${NGPUS}"
+    report_gpu_occupancy
+    requeue_if_gpu_busy
+    echo "DDP: ${NGPUS} GPUs, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}, SUBSLICE_PER_RANK=${SUBSLICE_PER_RANK}, total slices=$(( NGPUS * SUBSLICE_PER_RANK ))"
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # ---- OOM/contention-resilient launch (by-gpu). If another job lands on our GPU
+    #      and we CUDA-OOM, don't quit: wait for the co-tenant to die, then re-launch.
+    #      RESUME=1 continues from the last resume_ckpt.pth; we keep the SAME node +
+    #      GPU lock across all attempts. Only retries on an OOM/NCCL-contention error;
+    #      a real bug (missing data, code error) exits immediately. ----
+    ERRFILE="/home/alexsunuci/Aug_21_3D/Results/Portal_frame_half_3D/C6_Portal_frame_half_TO9_Sophia/C6_Portal_frame_half_TO9_Sophia.err"
+    SELFPY="/home/alexsunuci/Aug_21_3D/C6_Portal_frame_half_TO9_Sophia.py"
+    MAX_RETRIES=${MAX_RETRIES:-20}
+    RETRY_WAIT=${RETRY_WAIT:-90}
+    attempt=1
+    while true; do
+        echo "==== torchrun attempt ${attempt}/${MAX_RETRIES} on GPUs [${CUDA_VISIBLE_DEVICES}] ===="
+        _mark=$(wc -c < "${ERRFILE}" 2>/dev/null || echo 0)   # scan only THIS attempt's stderr
+        torchrun --standalone --nnodes=1 --nproc_per_node=${NGPUS} "${SELFPY}"
+        rc=$?
+        if [ ${rc} -eq 0 ]; then echo "==== finished OK on attempt ${attempt} ===="; break; fi
+        if tail -c "+$((_mark+1))" "${ERRFILE}" 2>/dev/null | grep -qiE "out of memory|OutOfMemoryError|Connection reset by peer|NCCL error|CUDA error|uncorrectable ECC"; then
+            pkill -u "${USER}" -f "${SELFPY}" 2>/dev/null; sleep 5   # clear any of OUR leftover ranks holding GPU mem
+            if [ ${attempt} -ge ${MAX_RETRIES} ]; then
+                echo "==== gave up after ${MAX_RETRIES} OOM/contention retries ====" >&2; break
+            fi
+            echo "==== attempt ${attempt}: OOM/contention (rc=${rc}). The co-tenant will OOM too; waiting ${RETRY_WAIT}s then resuming from resume_ckpt. ===="
+            attempt=$((attempt+1)); sleep ${RETRY_WAIT}; continue
+        fi
+        echo "==== attempt ${attempt} failed (rc=${rc}) but NOT an OOM -- real error, not retrying. ====" >&2; break
+    done
+fi
+
+deactivate
