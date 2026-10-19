@@ -62,6 +62,16 @@ The design is parameterized by the networks, not by the mesh, so refining the co
 
 All designs are verified by an independent finite element analysis (FEniCSx) of the remeshed geometry; in 2D the stress fields match or improve on PolyStress at lower volume fractions.
 
+## Computational cost and memory
+
+<p align="center">
+  <img src="figures/cost_3D_a.png" width="44%">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="figures/cost_3D_b.png" width="44%">
+  <br>
+  <em>Left: sub-slicing sweep on the 3D L beam with 1M nodal CPs on two GPUs. Increasing the number of sub-slices per GPU from 2 to 16 lowers the peak GPU memory from 68% to 14% at the cost of a longer training time. Right: multi-GPU sweep on the 3D portal frame with 2M nodal CPs. The number of sub-slices per GPU is reduced from 8 to 1 as the number of GPUs grows from 1 to 8, which keeps the peak memory constant while the training time drops from 9.4 h to 1.5 h. The optimized topologies, shown next to the data points, are unaffected by the partitioning.</em>
+</p>
+
 ## Highlights
 
 - Millions of local stress constraints handled directly, without p-norm or KS aggregation.
