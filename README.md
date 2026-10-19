@@ -2,7 +2,7 @@
 
 Official implementation of **Simultaneous Neural Topology Optimization (SNTO)**, a multi-GPU framework for stress-constrained topology optimization with millions of local stress constraints.
 
-> Xiangyu Sun, Shirin Hosseinmardi, Ramin Bostanabad, *Scalable Stress-Constrained Topology Optimization: A Super-resolution and Simultaneous Approach Based on Machine Learning*, University of California, Irvine. (Preprint link to be added.)
+> Xiangyu Sun, Shirin Hosseinmardi, Ramin Bostanabad, *Scalable Stress-Constrained Topology Optimization: A Super-resolution and Simultaneous Approach Based on Machine Learning*, University of California, Irvine, 2026.
 
 ## Overview
 
@@ -191,12 +191,11 @@ The `.slurm` and `.pbs` files are the job scripts used for the paper (NCSA Delta
 ## Citation
 
 ```bibtex
-@article{sun2026snto,
-  title   = {Scalable Stress-Constrained Topology Optimization: A Super-resolution and Simultaneous Approach Based on Machine Learning},
-  author  = {Sun, Xiangyu and Hosseinmardi, Shirin and Bostanabad, Ramin},
-  journal = {Computer Methods in Applied Mechanics and Engineering},
-  year    = {2026},
-  note    = {under review}
+@misc{sun2026snto,
+  title  = {Scalable Stress-Constrained Topology Optimization: A Super-resolution and Simultaneous Approach Based on Machine Learning},
+  author = {Sun, Xiangyu and Hosseinmardi, Shirin and Bostanabad, Ramin},
+  year   = {2026},
+  url    = {https://github.com/Bostanabad-Research-Group/Scalable-Stress-TO}
 }
 ```
 
